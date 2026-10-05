@@ -1,8 +1,8 @@
-// index.js
+
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import pokemon from "./data/pokemon.js";
+import pool from "./config/database.js"; // ← was: import pokemon from "./data/pokemon.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -11,6 +11,24 @@ const PORT = 3000;
 
 // Serve static files (custom.css) from /public
 app.use(express.static(path.join(__dirname, "public")));
+
+/* ------------------------------ Database -------------------------------- */
+
+
+const FIELDS = `
+  slug,
+  name,
+  pokedex_number  AS "pokedexNumber",
+  category,
+  types,
+  team_role       AS "teamRole",
+  ability,
+  signature_move  AS "signatureMove",
+  height,
+  weight,
+  description,
+  image
+`;
 
 /* ----------------------------- HTML helpers ----------------------------- */
 
@@ -64,31 +82,94 @@ function card(p) {
   </a>`;
 }
 
+// Stretch feature: the type filter form.
+function filterForm(allTypes, selected) {
+  const options = allTypes
+    .map(
+      (t) =>
+        `<option value="${t}" ${t === selected ? "selected" : ""}>${t}</option>`
+    )
+    .join("");
+
+  return `<form class="filter-form" method="GET" action="/">
+    <label for="type">Filter by type</label>
+    <select id="type" name="type">
+      <option value="">All types</option>
+      ${options}
+    </select>
+    <button type="submit">Search</button>
+    ${selected ? `<a href="/" role="button" class="secondary">Clear</a>` : ""}
+  </form>`;
+}
+
 /* -------------------------------- Routes -------------------------------- */
 
 // Home page: title + the team displayed as cards (stretch feature)
-app.get("/", (req, res) => {
-  const cards = pokemon.map(card).join("");
-  const body = `
+// Now `async` because talking to a database takes time.
+app.get("/", async (req, res) => {
+  try {
+    const selectedType = req.query.type || "";
+
+    // Build the list of types for the dropdown.
+    // unnest() flattens the TEXT[] array column into one row per value.
+    const typesResult = await pool.query(
+      `SELECT DISTINCT unnest(types) AS type FROM pokemon ORDER BY type`
+    );
+    const allTypes = typesResult.rows.map((r) => r.type);
+
+    // $1 = ANY(types) asks "is this value inside the array column?"
+    const result = selectedType
+      ? await pool.query(
+          `SELECT ${FIELDS} FROM pokemon WHERE $1 = ANY(types) ORDER BY pokedex_number`,
+          [selectedType]
+        )
+      : await pool.query(
+          `SELECT ${FIELDS} FROM pokemon ORDER BY pokedex_number`
+        );
+
+    const cards = result.rows.map(card).join("");
+
+    const body = `
     <header>
       <hgroup>
         <h1>The Team to Beat the Elite Four</h1>
         <p>Six Pokémon, one run at the Champion. Click any card for the full breakdown.</p>
       </hgroup>
     </header>
+    ${filterForm(allTypes, selectedType)}
     <section class="team-grid">
-      ${cards}
+      ${cards || "<p>No Pokémon match that type.</p>"}
     </section>`;
-  res.send(layout("Pokédex: Elite Four Edition", body));
+
+    res.send(layout("Pokédex: Elite Four Edition", body));
+  } catch (error) {
+    console.error(error);
+    res.status(500).send(
+      layout(
+        "Error",
+        `<h1>Database error</h1><p>Could not load the team. Is DATABASE_URL set correctly?</p>`
+      )
+    );
+  }
 });
 
 // Detail page: unique endpoint per Pokémon, shows ALL fields
-app.get("/pokemon/:slug", (req, res, next) => {
-  const p = pokemon.find((x) => x.slug === req.params.slug);
-  if (!p) return next(); // no match -> fall through to the 404 handler
+app.get("/pokemon/:slug", async (req, res, next) => {
+  try {
+    // $1 is a parameter placeholder. The slug from the URL is sent to
+    // Postgres separately from the query text, so a malicious slug can't
+    // inject SQL. This is the single most important habit in this project.
+    const result = await pool.query(
+      `SELECT ${FIELDS} FROM pokemon WHERE slug = $1`,
+      [req.params.slug]
+    );
 
-  const accent = `var(--type-${p.types[0]})`;
-  const body = `
+    if (result.rows.length === 0) return next(); // no match -> 404 handler
+
+    const p = result.rows[0];
+    const accent = `var(--type-${p.types[0]})`;
+
+    const body = `
     <a class="back-link" href="/">&larr; Back to the team</a>
     <article>
       <div class="detail-hero">
@@ -116,7 +197,12 @@ app.get("/pokemon/:slug", (req, res, next) => {
         </tbody>
       </table>
     </article>`;
-  res.send(layout(`${p.name} — Pokédex`, body));
+
+    res.send(layout(`${p.name} — Pokédex`, body));
+  } catch (error) {
+    console.error(error);
+    next();
+  }
 });
 
 // 404 handler: runs when no route above matched
